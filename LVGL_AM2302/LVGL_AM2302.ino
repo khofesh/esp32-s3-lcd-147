@@ -16,14 +16,17 @@ const char *password = "password";
 // server port number
 WiFiServer server(80);
 
-String header;
+// non-blocking WiFi connection
+WiFiEventId_t wifiConnectHandler;
+bool wifiConnected = false;
 
-// Current time
-unsigned long currentTime = millis();
-// Previous time
-unsigned long previousTime = 0; 
-// Define timeout time in milliseconds (example: 2000ms = 2s)
+// non-blocking client handling
+WiFiClient client;
+String currentLine = "";
+String header = "";
+unsigned long clientConnectTime = 0;
 const long timeoutTime = 2000;
+bool clientConnected = false;
 
 // Initialize DHT sensor
 DHT dht(DHTPIN, DHTTYPE);
@@ -41,9 +44,19 @@ float temperature = 0;
 float humidity = 0;
 float heatIndex = 0;
 
+// sensor reading
+bool readingInProgress = false;
+unsigned long readStartTime = 0;
+const long sensorReadInterval = 2000; // how often to read the sensor
+unsigned long lastSensorReadTime = 0;
+
 // Function prototypes
 void createDHTDisplay(lv_obj_t *parent);
 void updateSensorValues(lv_timer_t *timer);
+void onWiFiConnected(WiFiEvent_t event, WiFiEventInfo_t info);
+void handleClient();
+void startSensorReading();
+void finishSensorReading();
 
 void setup() {
   // Initialize serial communication
@@ -74,34 +87,172 @@ void setup() {
   SD_Init();
   Flash_test();
   
-  // connect to wifi network
+  // WiFi connection
+  // https://github.com/espressif/arduino-esp32/blob/master/libraries/WiFi/examples/WiFiClientEvents/WiFiClientEvents.ino
+  WiFi.mode(WIFI_STA);
+  wifiConnectHandler = WiFi.onEvent(onWiFiConnected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-  }
-  Serial.println(WiFi.localIP());
-  server.begin();
+  Serial.println("Connecting to WiFi...");
   
   // Set RGB LED to blue initially
   Set_Color(0, 0, 255);
+  
+  // start the server only after WiFi is connected (handled by event)
 }
 
 void loop() {
-  WiFiClient client = server.accept();
   // LVGL handling
   Timer_Loop();
   
   // Cycle the RGB LED colors
   RGB_Lamp_Loop(50);
 
-  if (client) 
-  {
-    showHttpToClient(&client);
+  // WiFi client handling
+  if (wifiConnected) {
+    if (!clientConnected) {
+      // Check for new client
+      client = server.accept();
+      if (client) {
+        Serial.println("New client connected");
+        clientConnected = true;
+        clientConnectTime = millis();
+        currentLine = "";
+        header = "";
+      }
+    } else {
+      // handle existing client
+      handleClient();
+    }
   }
   
-  // Give time for background tasks
-  delay(5);
+  // sensor reading at regular intervals
+  unsigned long currentMillis = millis();
+  if (!readingInProgress && currentMillis - lastSensorReadTime >= sensorReadInterval) {
+    startSensorReading();
+  }
+  
+  if (readingInProgress && currentMillis - readStartTime >= 250) {
+    // DHT readings can take 250ms, check if enough time has passed
+    finishSensorReading();
+  }
+}
+
+// WiFi connected event handler
+void onWiFiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.println("Connected to WiFi!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  wifiConnected = true;
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// Start the sensor reading process
+void startSensorReading() {
+  Serial.println("Starting sensor reading...");
+  readingInProgress = true;
+  readStartTime = millis();
+}
+
+// Complete the sensor reading process
+void finishSensorReading() {
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+  
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+  } else {
+    heatIndex = dht.computeHeatIndex(temperature, humidity, false);
+    
+    Serial.print(F("Humidity: "));
+    Serial.print(humidity);
+    Serial.print(F("%  Temperature: "));
+    Serial.print(temperature);
+    Serial.print(F("°C  Heat index: "));
+    Serial.print(heatIndex);
+    Serial.println(F("°C"));
+    
+    // update LVGL labels (will be handled by the updateSensorValues timer)
+    
+    // Adjust RGB LED color based on temperature
+    if (temperature > 30) {
+      Set_Color(255, 0, 0); // Red for hot
+    } else if (temperature > 25) {
+      Set_Color(255, 165, 0); // Orange for warm
+    } else if (temperature > 20) {
+      Set_Color(0, 255, 0); // Green for comfortable
+    } else {
+      Set_Color(0, 0, 255); // Blue for cool
+    }
+  }
+  
+  readingInProgress = false;
+  lastSensorReadTime = millis();
+}
+
+void handleClient() {
+  if (client.connected()) {
+    unsigned long currentTime = millis();
+    
+    // check if client timed out
+    if (currentTime - clientConnectTime > timeoutTime) {
+      Serial.println("Client timeout!");
+      client.stop();
+      clientConnected = false;
+      return;
+    }
+    
+    if (client.available()) {
+      char c = client.read();
+      header += c;
+      
+      if (c == '\n') {
+        if (currentLine.length() == 0) {
+          // HTTP headers ended, send response
+          client.println("HTTP/1.1 200 OK");
+          client.println("Content-type:text/html");
+          client.println("Connection: close");
+          client.println();
+          
+          // Display the HTML web page
+          client.println("<!DOCTYPE html><html>");
+          client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+          client.println("<link rel=\"icon\" href=\"data:,\">");
+          
+          client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
+          client.println(".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;");
+          client.println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
+          client.println(".button2 {background-color: #555555;}</style></head>");
+          
+          // Web Page Heading
+          client.println("<body><h1>ESP32 S3 Web Server</h1>");
+          
+          char buffer[100];
+          sprintf(buffer, "<p>Humidity: %.2f %%</p>", humidity);
+          client.println(buffer);
+          sprintf(buffer, "<p>Temperature: %.2f &deg;C</p>", temperature);
+          client.println(buffer);
+          sprintf(buffer, "<p>Heat Index: %.2f &deg;C</p>", heatIndex);
+          client.println(buffer);
+          
+          client.println("</body></html>");
+          client.println();
+          
+          // Finish and close the connection
+          client.stop();
+          clientConnected = false;
+          Serial.println("Client disconnected");
+        } else {
+          currentLine = "";
+        }
+      } else if (c != '\r') {
+        currentLine += c;
+      }
+    }
+  } else {
+    // Client disconnected
+    clientConnected = false;
+  }
 }
 
 // Create the display layout
@@ -142,25 +293,11 @@ void createDHTDisplay(lv_obj_t *parent) {
   heat_value = lv_label_create(panel);
   lv_label_set_text(heat_value, "---");
   lv_obj_align(heat_value, LV_ALIGN_TOP_RIGHT, -10, 120);
-  
 }
 
-// Timer callback to update sensor values
+// Timer callback to update displayed sensor values
 void updateSensorValues(lv_timer_t *timer) {
-  // Reading temperature and humidity
-  humidity = dht.readHumidity();
-  temperature = dht.readTemperature();
-  
-  // Check if any reads failed
-  if (isnan(humidity) || isnan(temperature)) {
-    Serial.println(F("Failed to read from DHT sensor!"));
-    return;
-  }
-  
-  // Compute heat index
-  heatIndex = dht.computeHeatIndex(temperature, humidity, false);
-  
-  // Update the display with new values
+  // Update the display with current values
   char buffer[32];
   
   snprintf(buffer, sizeof(buffer), "%.1f °C", temperature);
@@ -171,92 +308,4 @@ void updateSensorValues(lv_timer_t *timer) {
   
   snprintf(buffer, sizeof(buffer), "%.1f °C", heatIndex);
   lv_label_set_text(heat_value, buffer);
-  
-  // Print values to serial monitor
-  Serial.print(F("Humidity: "));
-  Serial.print(humidity);
-  Serial.print(F("%  Temperature: "));
-  Serial.print(temperature);
-  Serial.print(F("°C  Heat index: "));
-  Serial.print(heatIndex);
-  Serial.println(F("°C"));
-  
-  // Change RGB LED color based on temperature
-  if (temperature > 30) {
-    Set_Color(255, 0, 0); // Red for hot
-  } else if (temperature > 25) {
-    Set_Color(255, 165, 0); // Orange for warm
-  } else if (temperature > 20) {
-    Set_Color(0, 255, 0); // Green for comfortable
-  } else {
-    Set_Color(0, 0, 255); // Blue for cool
-  }
-}
-
-void showHttpToClient(WiFiClient *client) {
-  currentTime = millis();
-  previousTime = currentTime;
-  String currentLine = "";
-
-  while (client->connected() && currentTime - previousTime <= timeoutTime) 
-  {
-    currentTime = millis();
-    if (client->available()) 
-    {
-      char c = client->read();
-      Serial.write(c);
-      header += c;
-
-      if (c == '\n')
-      {
-        if (currentLine.length() == 0)
-        {
-          client->println("HTTP/1.1 200 OK");
-          client->println("Content-type:text/html");
-          client->println("Connection: close");
-          client->println();
-
-          // Display the HTML web page
-          client->println("<!DOCTYPE html><html>");
-          client->println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-          client->println("<link rel=\"icon\" href=\"data:,\">");
-
-          client->println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
-          client->println(".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;");
-          client->println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
-          client->println(".button2 {background-color: #555555;}</style></head>");
-            
-          // Web Page Heading
-          client->println("<body><h1>ESP32 S3 Web Server</h1>");
-
-          char buffer[100];
-          sprintf(buffer, "<p>Humidity: %.2f %%</p>", humidity);
-          client->println(buffer);
-          sprintf(buffer, "<p>Temperature: %.2f &deg;C</p>", temperature);
-          client->println(buffer);
-          sprintf(buffer, "<p>Heat Index: %.2f &deg;C</p>", heatIndex);
-          client->println(buffer);
-
-          client->println("</body></html>");
-
-          client->println();
-          break;
-        }
-        else {
-          currentLine = "";
-        }
-      }
-      else if (c != '\r') 
-      {
-        currentLine += c;
-      }
-    }
-  }
-
-  // Clear the header variable
-  header = "";
-  // Close the connection
-  client->stop();
-  Serial.println("Client disconnected.");
-  Serial.println("");
 }
