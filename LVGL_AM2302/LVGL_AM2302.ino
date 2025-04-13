@@ -9,6 +9,22 @@
 #define DHTPIN 4     // Digital pin connected to the DHT sensor
 #define DHTTYPE DHT22   // DHT 22 (AM2302), AM2321
 
+// wifi cred
+const char *ssid = "ssid";
+const char *password = "password";
+
+// server port number
+WiFiServer server(80);
+
+String header;
+
+// Current time
+unsigned long currentTime = millis();
+// Previous time
+unsigned long previousTime = 0; 
+// Define timeout time in milliseconds (example: 2000ms = 2s)
+const long timeoutTime = 2000;
+
 // Initialize DHT sensor
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -39,7 +55,7 @@ void setup() {
   
   // Initialize LCD
   LCD_Init();
-  Set_Backlight(90); // Set brightness to 90%
+  Set_Backlight(50); // Set brightness
   
   // RGB LED setup
   pinMode(PIN_NEOPIXEL, OUTPUT);
@@ -58,19 +74,31 @@ void setup() {
   SD_Init();
   Flash_test();
   
-  // Scan for wireless networks
-  Wireless_Test2();
+  // connect to wifi network
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+  }
+  Serial.println(WiFi.localIP());
+  server.begin();
   
   // Set RGB LED to blue initially
   Set_Color(0, 0, 255);
 }
 
 void loop() {
+  WiFiClient client = server.accept();
   // LVGL handling
   Timer_Loop();
   
   // Cycle the RGB LED colors
   RGB_Lamp_Loop(50);
+
+  if (client) 
+  {
+    showHttpToClient(&client);
+  }
   
   // Give time for background tasks
   delay(5);
@@ -163,4 +191,72 @@ void updateSensorValues(lv_timer_t *timer) {
   } else {
     Set_Color(0, 0, 255); // Blue for cool
   }
+}
+
+void showHttpToClient(WiFiClient *client) {
+  currentTime = millis();
+  previousTime = currentTime;
+  String currentLine = "";
+
+  while (client->connected() && currentTime - previousTime <= timeoutTime) 
+  {
+    currentTime = millis();
+    if (client->available()) 
+    {
+      char c = client->read();
+      Serial.write(c);
+      header += c;
+
+      if (c == '\n')
+      {
+        if (currentLine.length() == 0)
+        {
+          client->println("HTTP/1.1 200 OK");
+          client->println("Content-type:text/html");
+          client->println("Connection: close");
+          client->println();
+
+          // Display the HTML web page
+          client->println("<!DOCTYPE html><html>");
+          client->println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+          client->println("<link rel=\"icon\" href=\"data:,\">");
+
+          client->println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
+          client->println(".button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;");
+          client->println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
+          client->println(".button2 {background-color: #555555;}</style></head>");
+            
+          // Web Page Heading
+          client->println("<body><h1>ESP32 S3 Web Server</h1>");
+
+          char buffer[100];
+          sprintf(buffer, "<p>Humidity: %.2f %%</p>", humidity);
+          client->println(buffer);
+          sprintf(buffer, "<p>Temperature: %.2f &deg;C</p>", temperature);
+          client->println(buffer);
+          sprintf(buffer, "<p>Heat Index: %.2f &deg;C</p>", heatIndex);
+          client->println(buffer);
+
+          client->println("</body></html>");
+
+          client->println();
+          break;
+        }
+        else {
+          currentLine = "";
+        }
+      }
+      else if (c != '\r') 
+      {
+        currentLine += c;
+      }
+    }
+  }
+
+  // Clear the header variable
+  header = "";
+  // Close the connection
+  client->stop();
+  Serial.println("Client disconnected.");
+  Serial.println("");
 }
